@@ -179,21 +179,49 @@ const TREE_KG_PER_YR  = 22
 // pega DIRECTO a Hostinger y el navegador bloquea la respuesta por CORS
 // (Hostinger no manda la cabecera Access-Control-Allow-Origin).
 //
-// Usamos proxies CORS públicos para esos casos. corsproxy.io bloqueó el
-// contenido HTML hace tiempo (solo deja pasar JSON/CSV/XML), así que para
-// una fuente HTML como esta tabla NO sirve. Probamos varios proxies en
-// orden — si el primero falla (caído, rate-limit, bloqueo de tipo de
-// contenido), se intenta el siguiente automáticamente.
+// IMPORTANTE (descubierto en producción): los proxies CORS públicos
+// gratuitos tienen límites de tamaño de respuesta muy bajos
+// (corsproxy.io: 1MB → 413, codetabs: límite similar → 400) y la tabla
+// HTML de Hostinger ya los supera a medida que crece con el tiempo.
+// allorigins.win además ha estado intermitente/caído. Por eso estos
+// proxies YA NO SON CONFIABLES como fuente principal — se prueba primero,
+// y casi exclusivamente, el Worker propio de Cloudflare, que no tiene
+// ese límite de tamaño. Los proxies públicos quedan solo como respaldo
+// de último recurso, sabiendo que probablemente fallarán si la tabla es
+// grande.
 const HOSTINGER_BASE = 'https://peachpuff-stingray-882207.hostingersite.com'
 
+// Worker propio (Cloudflare) — sin límite de tamaño de payload práctico
+// (el plan gratis soporta respuestas de hasta 100MB+), a diferencia de los
+// proxies públicos gratuitos. Es la fuente principal y debería ser
+// suficiente por sí sola si está bien desplegado.
+const OWN_WORKER_PROXY = 'https://ener-tracker-proxy.soinsolar1.workers.dev/proxy-matriz'
+
 const PUBLIC_CORS_PROXIES = [
-  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
-  url => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(url)}`,
+  // 1. Worker propio: reenvía directo a la raíz de Hostinger, sin tocar la URL,
+  //    y sin el límite de tamaño que tienen los proxies públicos gratuitos.
+  { build: () => OWN_WORKER_PROXY, name: 'Worker propio' },
+  // 2-3. Proxies públicos de respaldo — casi seguro fallarán si la tabla supera
+  //    ~1MB, pero se dejan por si Hostinger reduce el tamaño de la tabla
+  //    (p.ej. paginación) o el Worker propio estuviera caído.
+  { build: url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`, name: 'allorigins' },
+  { build: url => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(url)}`, name: 'codetabs' },
+  // corsproxy.io al final: limita su tier gratis a 1MB de payload y, desde
+  // 2026, a peticiones desde localhost — casi nunca funcionará en producción.
+  { build: url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`, name: 'corsproxy.io' },
 ]
 
 function toRealUrl(url) {
+  // Caso 1: ruta interna '/proxy-matriz' (la usada en desarrollo) → raíz real
   if (url.startsWith('/proxy-matriz')) return HOSTINGER_BASE + url.replace('/proxy-matriz', '')
+
+  // Caso 2: alguien pegó manualmente la URL completa de Hostinger con
+  // '/proxy-matriz' al final (ruta que NO existe en el servidor real,
+  // la tabla vive en la raíz). La normalizamos también a la raíz.
+  if (url.startsWith(HOSTINGER_BASE + '/proxy-matriz')) {
+    return url.replace(HOSTINGER_BASE + '/proxy-matriz', HOSTINGER_BASE)
+  }
+
   return url
 }
 
@@ -204,10 +232,24 @@ function needsProxy(url) {
 }
 
 /**
- * Hace fetch probando, en orden, los proxies CORS públicos disponibles.
- * Si todos fallan, lanza el último error encontrado (con un mensaje claro).
+ * Hace fetch probando, en orden, los proxies CORS disponibles, empezando
+ * SIEMPRE por el Worker propio (sin límite de tamaño de payload).
+ * Si todos fallan, lanza un error con el detalle de CADA proxy y su causa
+ * específica (código HTTP o tipo de fallo), para poder diagnosticar sin
+ * tener que abrir DevTools.
+ *
  * Si la URL no necesita proxy (desarrollo, o ya es una API externa con
  * CORS habilitado), hace el fetch directo normal.
+ *
+ * IMPORTANTE: esta versión NO manda headers personalizados (como un
+ * 'Accept' no-estándar) en la petición al proxy. Un header de ese tipo
+ * convierte el GET en una petición "no simple" y obliga al navegador a
+ * hacer un preflight OPTIONS antes del GET real — si el proxy de turno no
+ * maneja ese preflight exactamente como el navegador espera, la petición
+ * falla con un error de red que en la consola se ve como CORS/400, aunque
+ * el proxy "funcione" cuando se prueba desde curl o un servidor (que no
+ * hacen preflight). Quitar el header evita ese preflight y hace el fetch
+ * mucho más confiable en producción.
  *
  * Cada intento de proxy tiene su propio timeout corto (6s) para que, si el
  * caller pasó un AbortSignal de timeout más largo, igual se pueda pasar al
@@ -218,30 +260,41 @@ export async function fetchSourceWithFallback(url, fetchOpts = {}) {
     return fetch(url, fetchOpts)
   }
 
-  // Importante: NO reutilizamos fetchOpts.signal para cada intento individual.
-  // Si el caller pidió un timeout de 8-10s y lo aplicáramos tal cual a cada
-  // proxy, el primero que esté lento consumiría todo el tiempo disponible
-  // y nunca se llegaría a probar el segundo o tercer proxy. En su lugar,
-  // cada intento tiene su propio timeout corto (6s) independiente.
-  const { signal: _ignoredSignal, ...restOpts } = fetchOpts
+  // Importante: NO reutilizamos fetchOpts.signal para cada intento individual,
+  // y tampoco reutilizamos fetchOpts.headers — ver nota arriba sobre por qué
+  // evitar headers personalizados en la petición al proxy.
+  const { signal: _ignoredSignal, headers: _ignoredHeaders, ...restOpts } = fetchOpts
   const realUrl = toRealUrl(url)
-  let lastError = null
+  const attempts = []
 
-  for (const buildProxyUrl of PUBLIC_CORS_PROXIES) {
+  for (const proxy of PUBLIC_CORS_PROXIES) {
     try {
-      const res = await fetch(buildProxyUrl(realUrl), {
+      const res = await fetch(proxy.build(realUrl), {
         ...restOpts,
-        signal: AbortSignal.timeout(6000),
+        signal: AbortSignal.timeout(8000),
       })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      if (!res.ok) {
+        const reason = res.status === 413
+          ? 'respuesta demasiado grande para este proxy'
+          : `HTTP ${res.status}`
+        attempts.push(`${proxy.name}: ${reason}`)
+        continue
+      }
       return res
     } catch (err) {
-      lastError = err
+      const isTimeout = err.name === 'TimeoutError' || err.name === 'AbortError'
+      const isCors = err instanceof TypeError // fetch lanza TypeError genérico en fallos de CORS/red
+      attempts.push(`${proxy.name}: ${isTimeout ? 'tiempo de espera agotado' : isCors ? 'bloqueado por CORS o proxy caído' : err.message}`)
       // Probar el siguiente proxy de la lista
     }
   }
 
-  throw new Error(`No se pudo conectar a través de ningún proxy disponible. Último error: ${lastError?.message ?? 'desconocido'}`)
+  const workerFailed = attempts[0]?.startsWith('Worker propio')
+  const hint = workerFailed
+    ? ' — revisa que el Worker esté desplegado (wrangler deploy) y accesible.'
+    : ''
+
+  throw new Error(`No se pudo conectar a través de ningún proxy disponible.${hint} Detalle: ${attempts.join(' | ')}`)
 }
 
 // Se mantiene exportada por compatibilidad, pero ya no se usa para construir
